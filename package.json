@@ -1,17 +1,22 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Vercel Serverless API Backend",
+  "main": "api/index.js",
   "scripts": {
-    "test": "node api/index.js",
-    "dev": "nodemon api/index.js"
+    "start": "node api/index.js",
+    "dev": "nodemon api/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^5.2.1"
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
 }
