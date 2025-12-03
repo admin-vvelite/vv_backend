@@ -1,16 +1,18 @@
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors"); 
+const cors = require("cors");
 const app = express();
 
 app.use(cors());
 
+app.get("/", (req, res) => {
+  res.send("Server is running. Go to /data to see the API.");
+});
+
 app.get("/data", async (req, res) => {
   try {
     console.log("Request received");
-    const response = await fetch(
-      process.env.APP_SCRIPT_API
-    );
+    const response = await fetch(process.env.APP_SCRIPT_API);
     const data = await response.json();
     res.json(data);
   } catch (err) {
@@ -19,4 +21,8 @@ app.get("/data", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("Proxy running on port 3000"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+module.exports = app;
