@@ -1,10 +1,12 @@
 const express = require("express");
+
 const cors = require("cors");
 const app = express();
+require("dotenv").config();
+
 const home_routes = require("../routes/home_routes");
 const odoo_routes = require("../routes/odoo_routes");
 
-require("dotenv").config();
 
 // Use CORS once with options
 app.use(
