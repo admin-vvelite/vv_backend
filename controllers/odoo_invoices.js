@@ -58,9 +58,11 @@ const invoices_controller = async (req, res) => {
     const dbUser = process.env.ODOO_USER;
     const dbPass = process.env.ODOO_PASS;
 
+    // 1. Authenticate
     const uid = await jsonRpc("common", "login", [dbName, dbUser, dbPass]);
     if (!uid) throw new Error("Odoo Authentication Failed");
 
+    // 2. Handle Partner (Customer)
     const email = order.email || order.customer.email;
     let partnerId;
 
@@ -96,6 +98,22 @@ const invoices_controller = async (req, res) => {
       ]);
     }
 
+    // 3. Handle Currency (Crucial Fix)
+    // Ensures we don't send USD amounts to a SAR account 1:1
+    let currencyId = false;
+    if (order.currency) {
+      const currencySearch = await jsonRpc("object", "execute_kw", [
+        dbName,
+        uid,
+        dbPass,
+        "res.currency",
+        "search",
+        [[["name", "=", order.currency]]],
+      ]);
+      if (currencySearch.length > 0) currencyId = currencySearch[0];
+    }
+
+    // 4. Build Invoice Lines (UPDATED FOR DISCOUNT)
     const invoiceLines = [];
 
     for (const item of order.line_items) {
@@ -112,11 +130,20 @@ const invoices_controller = async (req, res) => {
         if (productSearch.length > 0) productId = productSearch[0];
       }
 
+      // --- DISCOUNT LOGIC START ---
       const rawPrice = parseFloat(item.price);
+      const quantity = parseFloat(item.quantity);
       const totalLineDiscount = parseFloat(item.total_discount || 0);
-
-      const netUnitTest =
-        (rawPrice * item.quantity - totalLineDiscount) / item.quantity;
+      
+      // Calculate Total Line Price (without discount) to find the percentage
+      const totalLinePrice = rawPrice * quantity;
+      
+      let discountPercentage = 0;
+      if (totalLinePrice > 0 && totalLineDiscount > 0) {
+        // Formula: (Total Discount / Total Price) * 100
+        discountPercentage = (totalLineDiscount / totalLinePrice) * 100;
+      }
+      // --- DISCOUNT LOGIC END ---
 
       invoiceLines.push([
         0,
@@ -124,14 +151,15 @@ const invoices_controller = async (req, res) => {
         {
           product_id: productId || undefined,
           name: item.name,
-          quantity: item.quantity,
-          price_unit: netUnitTest,
-          discount: 0,
-          tax_ids: [[6, 0, []]],
+          quantity: quantity,
+          price_unit: rawPrice, // Shows Original Price
+          discount: discountPercentage, // Shows Discount %
+          tax_ids: [[6, 0, []]], // Clears taxes (adjust if needed)
         },
       ]);
     }
 
+    // 5. Create Invoice
     const invoiceId = await jsonRpc("object", "execute_kw", [
       dbName,
       uid,
@@ -142,6 +170,7 @@ const invoices_controller = async (req, res) => {
         {
           move_type: "out_invoice",
           partner_id: partnerId,
+          currency_id: currencyId || undefined, // Set Currency
           invoice_date: order.created_at.split("T")[0],
           ref: order.name,
           payment_reference: order.id.toString(),
@@ -150,6 +179,7 @@ const invoices_controller = async (req, res) => {
       ],
     ]);
 
+    // 6. Post Invoice
     await jsonRpc("object", "execute_kw", [
       dbName,
       uid,
@@ -159,6 +189,7 @@ const invoices_controller = async (req, res) => {
       [[invoiceId]],
     ]);
 
+    // 7. Handle Payment
     if (
       order.financial_status === "paid" ||
       order.financial_status === "partially_paid"
@@ -169,7 +200,6 @@ const invoices_controller = async (req, res) => {
         ""
       ).toLowerCase();
 
-      // B Get Target Account Code from Map
       const targetAccountCode =
         GATEWAY_TO_ACCOUNT_CODE[shopifyGateway] || DEFAULT_ACCOUNT_CODE;
 
@@ -177,7 +207,6 @@ const invoices_controller = async (req, res) => {
         `Payment Gateway: ${shopifyGateway} -> Target Account: ${targetAccountCode}`
       );
 
-      // 1 Find Account ID first
       const accountSearch = await jsonRpc("object", "execute_kw", [
         dbName,
         uid,
@@ -190,7 +219,6 @@ const invoices_controller = async (req, res) => {
       if (accountSearch.length > 0) {
         const accountId = accountSearch[0];
 
-        // 2 Find Journal using this Account
         const journalSearch = await jsonRpc("object", "execute_kw", [
           dbName,
           uid,
@@ -203,7 +231,7 @@ const invoices_controller = async (req, res) => {
         if (journalSearch.length > 0) {
           const journalId = journalSearch[0];
 
-          // D Create Payment
+          // Create Payment
           const paymentId = await jsonRpc("object", "execute_kw", [
             dbName,
             uid,
@@ -214,16 +242,17 @@ const invoices_controller = async (req, res) => {
               {
                 partner_id: partnerId,
                 amount: parseFloat(order.total_price),
+                currency_id: currencyId || undefined, // Ensure Payment uses same currency
                 date: order.created_at.split("T")[0],
-                journal_id: journalId, // The Specific Treasury Journal
+                journal_id: journalId,
                 payment_type: "inbound",
                 partner_type: "customer",
-                memo: `Shopify Order ${order.name}`, // Use 'memo' for Payments
+                memo: `Shopify Order ${order.name}`,
               },
             ],
           ]);
 
-          // E Post Payment
+          // Post Payment
           await jsonRpc("object", "execute_kw", [
             dbName,
             uid,
@@ -246,7 +275,7 @@ const invoices_controller = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: "Synced to Odoo",
+      message: "Synced to Odoo with Discounts and Currency",
       odoo_invoice_id: invoiceId,
     });
   } catch (error) {
