@@ -5,7 +5,7 @@ const fetch = (...args) =>
 
 /**
  * myFatoorah to Odoo Integration Controller
- * FIXED: Prevent duplicates + Forced Payment Registration on Account 101007
+ * FIXED: Prevent duplicates + Forced Payment Registration using Cash Journal (CSH1 / Main Treasury)
  */
 
 const jsonRpc = async (service, method, args) => {
@@ -54,10 +54,14 @@ const myfatoorah_odoo_controller = async (req, res) => {
     const uid = await jsonRpc("common", "login", [dbName, dbUser, dbPass]);
     if (!uid) throw new Error("Odoo Authentication Failed");
 
-    // 3. PREVENTION: Check if invoice already exists (Avoid duplicates 7, 8, 9, 10)
+    // 3. Prevent duplicate invoices
     const existingInvoice = await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "account.move", "search", 
-      [[["ref", "=", `MF-${Data.InvoiceId}`]]]
+      dbName,
+      uid,
+      dbPass,
+      "account.move",
+      "search",
+      [[["ref", "=", `MF-${Data.InvoiceId}`]]],
     ]);
 
     if (existingInvoice.length > 0) {
@@ -65,105 +69,135 @@ const myfatoorah_odoo_controller = async (req, res) => {
       return res.status(200).json({ success: true, message: "Duplicate invoice skipped" });
     }
 
-    // 4. Force USD Currency ID
+    // 4. Force USD Currency
     const currencyIds = await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "res.currency", "search", [[["name", "=", "USD"]]]
+      dbName,
+      uid,
+      dbPass,
+      "res.currency",
+      "search",
+      [[["name", "=", "USD"]]],
     ]);
     const usdId = currencyIds.length > 0 ? currencyIds[0] : false;
 
-    // 5. Partner (Customer) Logic
+    // 5. Partner (Customer)
     const email = Data.CustomerEmail;
     let partnerId;
+
     const searchPartner = await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "res.partner", "search", [[["email", "=", email]]]
+      dbName,
+      uid,
+      dbPass,
+      "res.partner",
+      "search",
+      [[["email", "=", email]]],
     ]);
 
     if (searchPartner.length > 0) {
       partnerId = searchPartner[0];
     } else {
       partnerId = await jsonRpc("object", "execute_kw", [
-        dbName, uid, dbPass, "res.partner", "create",
-        [{
-          name: Data.CustomerName,
-          email: email,
-          phone: Data.CustomerMobile || "",
-        }],
+        dbName,
+        uid,
+        dbPass,
+        "res.partner",
+        "create",
+        [
+          { name: Data.CustomerName, email: email, phone: Data.CustomerMobile || "" },
+        ],
       ]);
     }
 
-    // 6. Build Invoice Lines
-    const invoiceLines = (Data.InvoiceItems || []).map(item => [0, 0, {
-      name: item.ItemName,
-      quantity: item.Quantity,
-      price_unit: item.UnitPrice,
-      tax_ids: [[6, 0, []]], // No tax applied as per original
-    }]);
+    // 6. Invoice Lines
+    const invoiceLines = (Data.InvoiceItems || []).map((item) => [
+      0,
+      0,
+      { name: item.ItemName, quantity: item.Quantity, price_unit: item.UnitPrice, tax_ids: [[6, 0, []]] },
+    ]);
 
     if (Data.DiscountValue > 0) {
-      invoiceLines.push([0, 0, {
-        name: "Discount Applied",
-        quantity: 1,
-        price_unit: -parseFloat(Data.DiscountValue),
-      }]);
+      invoiceLines.push([0, 0, { name: "Discount Applied", quantity: 1, price_unit: -parseFloat(Data.DiscountValue) }]);
     }
 
     // 7. Create Draft Invoice
     const invoiceId = await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "account.move", "create",
-      [{
-        move_type: "out_invoice",
-        partner_id: partnerId,
-        currency_id: usdId,
-        invoice_date: new Date().toISOString().split("T")[0],
-        ref: `MF-${Data.InvoiceId}`,
-        invoice_line_ids: invoiceLines,
-        partner_bank_id: false,
-      }],
+      dbName,
+      uid,
+      dbPass,
+      "account.move",
+      "create",
+      [
+        {
+          move_type: "out_invoice",
+          partner_id: partnerId,
+          currency_id: usdId,
+          invoice_date: new Date().toISOString().split("T")[0],
+          ref: `MF-${Data.InvoiceId}`,
+          invoice_line_ids: invoiceLines,
+          partner_bank_id: false,
+        },
+      ],
     ]);
 
-    // 8. STEP 1: Post the Invoice (Entry: Customer Debit / Sales Credit)
+    // 8. Post Invoice
     await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "account.move", "action_post", [[invoiceId]]
+      dbName,
+      uid,
+      dbPass,
+      "account.move",
+      "action_post",
+      [[invoiceId]],
     ]);
 
-    // 9. STEP 2: Register Payment (Entry: MyFatoorah 101007 Debit / Customer Credit)
-    // Find the journal linked to the MyFatoorah account 101007
-    const journalSearch = await jsonRpc("object", "execute_kw", [
-      dbName, uid, dbPass, "account.journal", "search", 
-      [[["default_account_id.code", "=", "101007"]]]
+    // 9. Register Payment using Cash Journal directly
+    const cashJournalSearch = await jsonRpc("object", "execute_kw", [
+      dbName,
+      uid,
+      dbPass,
+      "account.journal",
+      "search",
+      [[["code", "=", "CSH1"]]],
     ]);
 
-    if (journalSearch.length > 0) {
-      const journalId = journalSearch[0];
+    if (cashJournalSearch.length === 0) {
+      throw new Error("Cash Journal (CSH1 / Main Treasury) not found in Odoo.");
+    }
 
-      // Create Payment Register Wizard
-      const paymentRegisterId = await jsonRpc("object", "execute_kw", [
-        dbName, uid, dbPass, "account.payment.register", "create",
-        [{
-          active_model: 'account.move',
-          active_ids: [invoiceId],
+    const journalId = cashJournalSearch[0];
+
+    // Create Payment Register
+    const paymentRegisterId = await jsonRpc("object", "execute_kw", [
+      dbName,
+      uid,
+      dbPass,
+      "account.payment.register",
+      "create",
+      [
+        {
           journal_id: journalId,
           amount: parseFloat(Data.InvoiceValue),
           payment_date: new Date().toISOString().split("T")[0],
           communication: `MF-${Data.InvoiceId}`,
-        }]
-      ]);
+        },
+      ],
+      {
+        context: { active_model: "account.move", active_ids: [invoiceId] },
+      },
+    ]);
 
-      // Execute Payment Action
-      await jsonRpc("object", "execute_kw", [
-        dbName, uid, dbPass, "account.payment.register", "action_create_payments", [[paymentRegisterId]]
-      ]);
+    // Execute Payment
+    await jsonRpc("object", "execute_kw", [
+      dbName,
+      uid,
+      dbPass,
+      "account.payment.register",
+      "action_create_payments",
+      [[paymentRegisterId]],
+    ]);
 
-      console.log(`✅ Success: Invoice MF-${Data.InvoiceId} posted and paid via account 101007`);
-    } else {
-      console.warn("⚠️ Warning: Invoice posted but journal for account 101007 not found. Payment not registered.");
-    }
+    console.log(`✅ Success: Invoice MF-${Data.InvoiceId} paid via Cash Journal (CSH1)`);
 
-    res.status(200).json({
-      success: true,
-      message: "Invoice synced and paid",
-      odoo_invoice_id: invoiceId,
-    });
+    res.status(200).json({ success: true, message: "Invoice synced and paid", odoo_invoice_id: invoiceId });
 
   } catch (error) {
     console.error("❌ Sync Error:", error.message);
