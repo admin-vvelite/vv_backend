@@ -1,15 +1,14 @@
 const crypto = require("crypto");
-
-// dynamic import for node-fetch
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 /**
- * MyFatoorah → Odoo Controller
- * Webhook V2 Compatible
+ * myFatoorah to Odoo Integration Controller
+ * FORCED: Journal 6 | Account 170 (101001)
+ * FIXED: Scientific notation in reference + Explicit Account mapping
  */
 
-const jsonRpc = async (service, method, args, kwargs = {}) => {
+const jsonRpc = async (service, method, args) => {
   const ODOO_CONFIG = {
     url: process.env.ODOO_URL,
     db: process.env.ODOO_DB,
@@ -20,7 +19,7 @@ const jsonRpc = async (service, method, args, kwargs = {}) => {
   const payload = {
     jsonrpc: "2.0",
     method: "call",
-    params: { service, method, args, kwargs },
+    params: { service, method, args },
     id: Math.floor(Math.random() * 1000000),
   };
 
@@ -31,231 +30,143 @@ const jsonRpc = async (service, method, args, kwargs = {}) => {
   });
 
   const result = await response.json();
-
   if (result.error) {
     throw new Error(`Odoo Error: ${result.error.data.message}`);
   }
-
   return result.result;
 };
 
-
-// --- MAIN CONTROLLER ---
 const myfatoorah_odoo_controller = async (req, res) => {
   try {
+    const { Data, Event } = req.body;
 
-    console.log("Webhook received:", JSON.stringify(req.body, null, 2));
-
-    const { Event, Data } = req.body;
-
-    // 1️⃣ Validate event name (Webhook V2 structure)
-    if (!Event || Event.Name !== "PAYMENT_STATUS_CHANGED") {
+    // 1. V2 Webhook Filter
+    if (Event.Name !== "PAYMENT_STATUS_CHANGED" || Data.Invoice.Status !== "PAID") {
       return res.status(200).json({ message: "Event ignored" });
     }
-
-    // 2️⃣ Validate payment success
-    if (
-      Data?.Invoice?.Status !== "PAID" ||
-      Data?.Transaction?.Status !== "SUCCESS"
-    ) {
-      return res.status(200).json({ message: "Payment not successful yet" });
-    }
-
-    const invoiceIdMF = Data.Invoice.Id;
 
     const dbName = process.env.ODOO_DB;
     const dbUser = process.env.ODOO_USER;
     const dbPass = process.env.ODOO_PASS;
 
-    // 3️⃣ Odoo Authentication
     const uid = await jsonRpc("common", "login", [dbName, dbUser, dbPass]);
     if (!uid) throw new Error("Odoo Authentication Failed");
 
+    // FIX: Convert ID to String immediately to prevent scientific notation (9.933e+22)
+    const rawInvoiceId = String(Data.Invoice.Id);
+    const mfRef = `MF-${rawInvoiceId}`;
 
-    // 4️⃣ Prevent duplicate invoices
+    // 2. Prevent duplicate invoices
     const existingInvoice = await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "account.move",
-      "search",
-      [[["ref", "=", `MF-${invoiceIdMF}`]]],
+      dbName, uid, dbPass,
+      "account.move", "search", [[["ref", "=", mfRef]]],
     ]);
 
     if (existingInvoice.length > 0) {
-      console.log(`Duplicate detected: MF-${invoiceIdMF}`);
-      return res.status(200).json({ message: "Duplicate skipped" });
+      console.log(`⚠️ Duplicate skipped: ${mfRef}`);
+      return res.status(200).json({ success: true, message: "Duplicate skipped" });
     }
 
-
-    // 5️⃣ Get USD currency
+    // 3. Force USD Currency
     const currencyIds = await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "res.currency",
-      "search",
-      [[["name", "=", "USD"]]],
+      dbName, uid, dbPass,
+      "res.currency", "search", [[["name", "=", "USD"]]],
     ]);
+    const usdId = currencyIds.length > 0 ? currencyIds[0] : false;
 
-    const usdId = currencyIds.length ? currencyIds[0] : false;
-
-
-    // 6️⃣ Customer data (Webhook V2 location)
-    const email = Data.Customer?.Email || "unknown@email.com";
-    const name = Data.Customer?.Name || "MyFatoorah Customer";
-    const phone = Data.Customer?.Mobile || "";
-
+    // 4. Partner Logic
+    const email = Data.Customer.Email || `no-email-${rawInvoiceId}@example.com`;
     let partnerId;
 
     const searchPartner = await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "res.partner",
-      "search",
-      [[["email", "=", email]]],
+      dbName, uid, dbPass,
+      "res.partner", "search", [[["email", "=", email]]],
     ]);
 
     if (searchPartner.length > 0) {
       partnerId = searchPartner[0];
     } else {
       partnerId = await jsonRpc("object", "execute_kw", [
-        dbName,
-        uid,
-        dbPass,
-        "res.partner",
-        "create",
-        [
-          {
-            name: name,
-            email: email,
-            phone: phone,
-          },
-        ],
+        dbName, uid, dbPass,
+        "res.partner", "create",
+        [{ 
+            name: Data.Customer.Name || "Customer", 
+            email: email, 
+            phone: Data.Customer.Mobile || "" 
+        }],
       ]);
     }
 
+    // 5. Create Draft Invoice
+    const invoiceLines = [[0, 0, { 
+      name: `Payment for Invoice #${rawInvoiceId}`, 
+      quantity: 1, 
+      price_unit: parseFloat(Data.Amount.ValueInDisplayCurrency), 
+      tax_ids: [[6, 0, []]] 
+    }]];
 
-    // 7️⃣ Invoice lines
-    const amount = parseFloat(Data.Amount.ValueInDisplayCurrency);
-
-    const invoiceLines = [
-      [
-        0,
-        0,
-        {
-          name: "Payment via MyFatoorah",
-          quantity: 1,
-          price_unit: amount,
-          tax_ids: [[6, 0, []]],
-        },
-      ],
-    ];
-
-
-    // 8️⃣ Create invoice
     const invoiceId = await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "account.move",
-      "create",
-      [
-        {
-          move_type: "out_invoice",
-          partner_id: partnerId,
-          currency_id: usdId,
-          invoice_date: new Date().toISOString().split("T")[0],
-          ref: `MF-${invoiceIdMF}`,
-          invoice_line_ids: invoiceLines,
-        },
-      ],
+      dbName, uid, dbPass,
+      "account.move", "create",
+      [{
+        move_type: "out_invoice",
+        partner_id: partnerId,
+        currency_id: usdId,
+        invoice_date: new Date().toISOString().split("T")[0],
+        ref: mfRef,
+        invoice_line_ids: invoiceLines,
+      }],
     ]);
 
-
-    // 9️⃣ Post invoice
+    // 6. Post Invoice
     await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "account.move",
-      "action_post",
-      [[invoiceId]],
+      dbName, uid, dbPass,
+      "account.move", "action_post", [[invoiceId]],
     ]);
 
-
-    // 🔟 Find cash journal
-    const cashJournalSearch = await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "account.journal",
-      "search",
-      [[["code", "=", "CSH1"]]],
+    // 7. Get Payment Method Line for Journal 6
+    const journalInfo = await jsonRpc("object", "execute_kw", [
+      dbName, uid, dbPass,
+      "account.journal", "read", [[6], ["inbound_payment_method_line_ids"]]
     ]);
+    const methodLineId = journalInfo[0].inbound_payment_method_line_ids[0];
 
-    if (cashJournalSearch.length === 0) {
-      throw new Error("Cash Journal CSH1 not found.");
-    }
-
-    const journalId = cashJournalSearch[0];
-
-
-    // 11️⃣ Register payment
-    const paymentRegisterId = await jsonRpc(
-      "object",
-      "execute_kw",
-      [
-        dbName,
-        uid,
-        dbPass,
-        "account.payment.register",
-        "create",
-        [
-          {
-            journal_id: journalId,
-            amount: amount,
-            payment_date: new Date().toISOString().split("T")[0],
-            communication: `MF-${invoiceIdMF}`,
-          },
-        ],
-      ],
+    // 8. Register Payment (Forcing Account 170 via Context)
+    const paymentRegisterId = await jsonRpc("object", "execute_kw", [
+      dbName, uid, dbPass,
+      "account.payment.register", "create",
+      [{
+        journal_id: 6,
+        payment_method_line_id: methodLineId,
+        amount: parseFloat(Data.Amount.ValueInDisplayCurrency),
+        payment_date: new Date().toISOString().split("T")[0],
+        communication: mfRef,
+      }],
       {
-        context: {
-          active_model: "account.move",
+        context: { 
+          active_model: "account.move", 
           active_ids: [invoiceId],
+          // FORCE THESE PARAMETERS
+          default_journal_id: 6,
+          default_account_id: 170, // Force account 101001
+          default_payment_type: 'inbound'
         },
-      }
-    );
-
-
-    // 12️⃣ Execute payment
-    await jsonRpc("object", "execute_kw", [
-      dbName,
-      uid,
-      dbPass,
-      "account.payment.register",
-      "action_create_payments",
-      [[paymentRegisterId]],
+      },
     ]);
 
+    // 9. Execute Payment
+    await jsonRpc("object", "execute_kw", [
+      dbName, uid, dbPass,
+      "account.payment.register", "action_create_payments", [[paymentRegisterId]],
+    ]);
 
-    console.log(`Success: MF-${invoiceIdMF} synced to Odoo`);
-
-    res.status(200).json({
-      success: true,
-      message: "Invoice synced and paid",
-      odoo_invoice_id: invoiceId,
-    });
+    console.log(`✅ Success: Registered to Journal 6, Account 170. Ref: ${mfRef}`);
+    res.status(200).json({ success: true, odoo_invoice_id: invoiceId });
 
   } catch (error) {
-    console.error("Sync Error:", error.message);
+    console.error("❌ Sync Error:", error.message);
     res.status(500).json({ error: error.message });
   }
 };
 
-
-module.exports = {
-  myfatoorah_odoo_controller,
-};
+module.exports = { myfatoorah_odoo_controller };
