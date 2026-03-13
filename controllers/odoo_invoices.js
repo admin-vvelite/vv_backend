@@ -1,20 +1,12 @@
-const GATEWAY_TO_ACCOUNT_CODE = {
-  tap: "101008", // Tap pay Treasury
-  stc_pay: "101009", // Stc pay Treasury
-  tamara: "101010", // Tamara Treasury
-  paypal: "101011", // Pay pal Treasury
-  moyassar: "101012", // Moyassar Treasury
-  alrajhi: "101020", // Alrajhi Bank (SAR)
-};
-
-const DEFAULT_ACCOUNT_CODE = "101020";
+const BANK_JOURNAL_ID = 6;
+const CURRENCY = "USD";
 
 const jsonRpc = async (service, method, args) => {
   const ODOO_CONFIG = {
     url: process.env.ODOO_URL,
     db: process.env.ODOO_DB || "vvelite2",
     username: process.env.ODOO_USER || "admin@vvelite.com",
-    password: process.env.ODOO_PASS, // API Key
+    password: process.env.ODOO_PASS,
   };
 
   if (!ODOO_CONFIG.password) {
@@ -35,15 +27,17 @@ const jsonRpc = async (service, method, args) => {
   });
 
   const result = await response.json();
+
   if (result.error) {
     throw new Error(
       `Odoo Error (${result.error.data.message}): ${result.error.data.debug}`
     );
   }
+
   return result.result;
 };
 
-// --- MAIN CONTROLLER ---
+// MAIN CONTROLLER
 const invoices_controller = async (req, res) => {
   const order = req.body;
 
@@ -60,6 +54,7 @@ const invoices_controller = async (req, res) => {
 
     // 1. Authenticate
     const uid = await jsonRpc("common", "login", [dbName, dbUser, dbPass]);
+
     if (!uid) throw new Error("Odoo Authentication Failed");
 
     // 2. Handle Partner (Customer)
@@ -86,9 +81,11 @@ const invoices_controller = async (req, res) => {
         "create",
         [
           {
-            name: `${order.customer.first_name} ${order.customer.last_name}`,
+            name: `${order.customer?.first_name || ""} ${
+              order.customer?.last_name || ""
+            }`,
             email: email,
-            phone: order.customer.phone || "",
+            phone: order.customer?.phone || "",
             street: order.shipping_address?.address1,
             city: order.shipping_address?.city,
             zip: order.shipping_address?.zip,
@@ -118,6 +115,7 @@ const invoices_controller = async (req, res) => {
 
     for (const item of order.line_items) {
       let productId = false;
+
       if (item.sku) {
         const productSearch = await jsonRpc("object", "execute_kw", [
           dbName,
@@ -127,6 +125,7 @@ const invoices_controller = async (req, res) => {
           "search",
           [[["default_code", "=", item.sku]]],
         ]);
+
         if (productSearch.length > 0) productId = productSearch[0];
       }
 
@@ -174,6 +173,7 @@ const invoices_controller = async (req, res) => {
           invoice_date: order.created_at.split("T")[0],
           ref: order.name,
           payment_reference: order.id.toString(),
+          currency_id: currencyId,
           invoice_line_ids: invoiceLines,
         },
       ],
@@ -211,9 +211,20 @@ const invoices_controller = async (req, res) => {
         dbName,
         uid,
         dbPass,
-        "account.account",
-        "search",
-        [[["code", "=", targetAccountCode]]],
+        "account.payment",
+        "create",
+        [
+          {
+            partner_id: partnerId,
+            amount: parseFloat(order.total_price),
+            currency_id: currencyId,
+            date: order.created_at.split("T")[0],
+            journal_id: BANK_JOURNAL_ID,
+            payment_type: "inbound",
+            partner_type: "customer",
+            memo: `Shopify Order ${order.name}`,
+          },
+        ],
       ]);
 
       if (accountSearch.length > 0) {
@@ -280,7 +291,10 @@ const invoices_controller = async (req, res) => {
     });
   } catch (error) {
     console.error("Sync Error:", error);
-    res.status(500).json({ error: error.message });
+
+    res.status(500).json({
+      error: error.message,
+    });
   }
 };
 
