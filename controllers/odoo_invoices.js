@@ -1,20 +1,12 @@
-const GATEWAY_TO_ACCOUNT_CODE = {
-  tap: "101008", // Tap pay Treasury
-  stc_pay: "101009", // Stc pay Treasury
-  tamara: "101010", // Tamara Treasury
-  paypal: "101011", // Pay pal Treasury
-  moyassar: "101012", // Moyassar Treasury
-  alrajhi: "101020", // Alrajhi Bank (SAR)
-};
-
-const DEFAULT_ACCOUNT_CODE = "101020";
+const BANK_JOURNAL_ID = 6;
+const CURRENCY = "USD";
 
 const jsonRpc = async (service, method, args) => {
   const ODOO_CONFIG = {
     url: process.env.ODOO_URL,
     db: process.env.ODOO_DB || "vvelite2",
     username: process.env.ODOO_USER || "admin@vvelite.com",
-    password: process.env.ODOO_PASS, // API Key
+    password: process.env.ODOO_PASS,
   };
 
   if (!ODOO_CONFIG.password) {
@@ -35,15 +27,17 @@ const jsonRpc = async (service, method, args) => {
   });
 
   const result = await response.json();
+
   if (result.error) {
     throw new Error(
       `Odoo Error (${result.error.data.message}): ${result.error.data.debug}`
     );
   }
+
   return result.result;
 };
 
-// --- MAIN CONTROLLER ---
+// MAIN CONTROLLER
 const invoices_controller = async (req, res) => {
   const order = req.body;
 
@@ -59,9 +53,11 @@ const invoices_controller = async (req, res) => {
     const dbPass = process.env.ODOO_PASS;
 
     const uid = await jsonRpc("common", "login", [dbName, dbUser, dbPass]);
+
     if (!uid) throw new Error("Odoo Authentication Failed");
 
-    const email = order.email || order.customer.email;
+    const email = order.email || order.customer?.email;
+
     let partnerId;
 
     const searchPartner = await jsonRpc("object", "execute_kw", [
@@ -84,9 +80,11 @@ const invoices_controller = async (req, res) => {
         "create",
         [
           {
-            name: `${order.customer.first_name} ${order.customer.last_name}`,
+            name: `${order.customer?.first_name || ""} ${
+              order.customer?.last_name || ""
+            }`,
             email: email,
-            phone: order.customer.phone || "",
+            phone: order.customer?.phone || "",
             street: order.shipping_address?.address1,
             city: order.shipping_address?.city,
             zip: order.shipping_address?.zip,
@@ -100,6 +98,7 @@ const invoices_controller = async (req, res) => {
 
     for (const item of order.line_items) {
       let productId = false;
+
       if (item.sku) {
         const productSearch = await jsonRpc("object", "execute_kw", [
           dbName,
@@ -109,13 +108,14 @@ const invoices_controller = async (req, res) => {
           "search",
           [[["default_code", "=", item.sku]]],
         ]);
+
         if (productSearch.length > 0) productId = productSearch[0];
       }
 
       const rawPrice = parseFloat(item.price);
       const totalLineDiscount = parseFloat(item.total_discount || 0);
 
-      const netUnitTest =
+      const netUnitPrice =
         (rawPrice * item.quantity - totalLineDiscount) / item.quantity;
 
       invoiceLines.push([
@@ -125,13 +125,26 @@ const invoices_controller = async (req, res) => {
           product_id: productId || undefined,
           name: item.name,
           quantity: item.quantity,
-          price_unit: netUnitTest,
+          price_unit: netUnitPrice,
           discount: 0,
           tax_ids: [[6, 0, []]],
         },
       ]);
     }
 
+    // GET USD CURRENCY ID
+    const currencySearch = await jsonRpc("object", "execute_kw", [
+      dbName,
+      uid,
+      dbPass,
+      "res.currency",
+      "search",
+      [[["name", "=", CURRENCY]]],
+    ]);
+
+    const currencyId = currencySearch[0];
+
+    // CREATE INVOICE
     const invoiceId = await jsonRpc("object", "execute_kw", [
       dbName,
       uid,
@@ -145,6 +158,7 @@ const invoices_controller = async (req, res) => {
           invoice_date: order.created_at.split("T")[0],
           ref: order.name,
           payment_reference: order.id.toString(),
+          currency_id: currencyId,
           invoice_line_ids: invoiceLines,
         },
       ],
@@ -159,89 +173,43 @@ const invoices_controller = async (req, res) => {
       [[invoiceId]],
     ]);
 
+    // REGISTER PAYMENT
     if (
       order.financial_status === "paid" ||
       order.financial_status === "partially_paid"
     ) {
-      const shopifyGateway = (
-        order.gateway ||
-        (order.payment_gateway_names && order.payment_gateway_names[0]) ||
-        ""
-      ).toLowerCase();
+      console.log(`Registering payment in Bank Journal 6`);
 
-      // B Get Target Account Code from Map
-      const targetAccountCode =
-        GATEWAY_TO_ACCOUNT_CODE[shopifyGateway] || DEFAULT_ACCOUNT_CODE;
-
-      console.log(
-        `Payment Gateway: ${shopifyGateway} -> Target Account: ${targetAccountCode}`
-      );
-
-      // 1 Find Account ID first
-      const accountSearch = await jsonRpc("object", "execute_kw", [
+      const paymentId = await jsonRpc("object", "execute_kw", [
         dbName,
         uid,
         dbPass,
-        "account.account",
-        "search",
-        [[["code", "=", targetAccountCode]]],
+        "account.payment",
+        "create",
+        [
+          {
+            partner_id: partnerId,
+            amount: parseFloat(order.total_price),
+            currency_id: currencyId,
+            date: order.created_at.split("T")[0],
+            journal_id: BANK_JOURNAL_ID,
+            payment_type: "inbound",
+            partner_type: "customer",
+            memo: `Shopify Order ${order.name}`,
+          },
+        ],
       ]);
 
-      if (accountSearch.length > 0) {
-        const accountId = accountSearch[0];
+      await jsonRpc("object", "execute_kw", [
+        dbName,
+        uid,
+        dbPass,
+        "account.payment",
+        "action_post",
+        [[paymentId]],
+      ]);
 
-        // 2 Find Journal using this Account
-        const journalSearch = await jsonRpc("object", "execute_kw", [
-          dbName,
-          uid,
-          dbPass,
-          "account.journal",
-          "search",
-          [[["default_account_id", "=", accountId]]],
-        ]);
-
-        if (journalSearch.length > 0) {
-          const journalId = journalSearch[0];
-
-          // D Create Payment
-          const paymentId = await jsonRpc("object", "execute_kw", [
-            dbName,
-            uid,
-            dbPass,
-            "account.payment",
-            "create",
-            [
-              {
-                partner_id: partnerId,
-                amount: parseFloat(order.total_price),
-                date: order.created_at.split("T")[0],
-                journal_id: journalId, // The Specific Treasury Journal
-                payment_type: "inbound",
-                partner_type: "customer",
-                memo: `Shopify Order ${order.name}`, // Use 'memo' for Payments
-              },
-            ],
-          ]);
-
-          // E Post Payment
-          await jsonRpc("object", "execute_kw", [
-            dbName,
-            uid,
-            dbPass,
-            "account.payment",
-            "action_post",
-            [[paymentId]],
-          ]);
-
-          console.log(`Payment Registered on Journal ID: ${journalId}`);
-        } else {
-          console.warn(
-            `No Journal found for Account Code ${targetAccountCode}`
-          );
-        }
-      } else {
-        console.warn(`Account Code ${targetAccountCode} not found in Odoo`);
-      }
+      console.log(`Payment Registered in Bank Journal`);
     }
 
     res.status(200).json({
@@ -251,7 +219,10 @@ const invoices_controller = async (req, res) => {
     });
   } catch (error) {
     console.error("Sync Error:", error);
-    res.status(500).json({ error: error.message });
+
+    res.status(500).json({
+      error: error.message,
+    });
   }
 };
 
